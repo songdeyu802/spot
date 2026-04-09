@@ -320,7 +320,8 @@ class Unet(nn.Module):
 
     def forward(self, inputs):
         if self.backbone == 'myunet':
-            return self.net(inputs)
+            outputs = self.net(inputs)
+            return outputs[0] if isinstance(outputs, (tuple, list)) else outputs
         else:
             if self.backbone == 'vgg':
                 [feat1, feat2, feat3, feat4, feat5] = self.vgg.forward(inputs)
@@ -421,12 +422,17 @@ class DualBranchUnet(nn.Module):
             self.det_branch = Unet_DNA(num_classes=num_classes, deep_supervision=True)
         else:
             self.det_branch = Unet(num_classes=num_classes, pretrained=det_pretrained, backbone=det_backbone)
-        self.noise_branch = NoiseSuppressionBranch(in_channels=1, base_channels=32, out_channels=num_classes)
+        self.noise_branch = NoiseSuppressionBranch(in_channels=1, base_channels=32, out_channels=1)
         self.fusion_alpha = nn.Parameter(torch.tensor(float(fusion_alpha_init)))
         self.noise_act = nn.Sigmoid()
 
     def _fuse(self, det_logit, noise_logit):
-        return det_logit - self.fusion_alpha * self.noise_act(noise_logit)
+        noise_prob = self.noise_act(noise_logit)
+        if det_logit.shape[1] > 1:
+            fused = det_logit.clone()
+            fused[:, 1:2, :, :] = fused[:, 1:2, :, :] - self.fusion_alpha * noise_prob
+            return fused
+        return det_logit - self.fusion_alpha * noise_prob
 
     def forward(self, x):
         det_outputs = self.det_branch(x)

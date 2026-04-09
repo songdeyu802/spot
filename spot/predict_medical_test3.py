@@ -7,7 +7,7 @@ from PIL import Image
 import torch
 import cv2
 from skimage.morphology import binary_erosion, disk
-from nets.unet import Unet
+from nets.unet import Unet, DualBranchUnet
 from scipy.linalg import svd
 from scipy.optimize import linear_sum_assignment
 import itertools
@@ -26,9 +26,10 @@ GT_MASK_PATH = "E:/unet-pytorch-main/Medical_Datasets/Labels/image_51.png"
 
 SAVE_DIR = "pred_results"
 BACKBONE = "myunet"
+USE_DUAL_BRANCH = True
 NUM_CLASSES = 2
 # 使用正方形输入，减少边缘漏检
-INPUT_SHAPE = [720, 720]  # [height, width]
+INPUT_SHAPE = [512, 640]  # [height, width]
 CUDA = True
 
 # 单次预测阈值
@@ -757,7 +758,16 @@ def main():
     print("=================\n")
 
     # 1. 加载模型
-    model = Unet(num_classes=NUM_CLASSES, pretrained=False, backbone=BACKBONE)
+    if USE_DUAL_BRANCH:
+        model = DualBranchUnet(
+            num_classes=NUM_CLASSES,
+            det_backbone=BACKBONE,
+            det_pretrained=False,
+            use_unet_dna=True,
+            fusion_alpha_init=1.0
+        )
+    else:
+        model = Unet(num_classes=NUM_CLASSES, pretrained=False, backbone=BACKBONE)
     state_dict = torch.load(MODEL_PATH, map_location=device)
     model.load_state_dict(state_dict)
     model = model.to(device)
@@ -809,7 +819,8 @@ def main():
 
         with torch.no_grad():
             images = torch.from_numpy(image_data).float().to(device)
-            outputs, _, _, _ = model(images)
+            model_out = model(images)
+            outputs = model_out[0] if isinstance(model_out, (list, tuple)) else model_out
             probs = torch.softmax(outputs, dim=1)[0, 1].cpu().numpy()
 
             # 裁掉padding区域

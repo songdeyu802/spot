@@ -20,7 +20,7 @@ from .utils_metrics import compute_mIoU
 
 
 class LossHistory():
-    def __init__(self, log_dir, model, input_shape, val_loss_flag=True):
+    def __init__(self, log_dir, model, input_shape, val_loss_flag=True, input_channels=3):
         self.log_dir        = log_dir
         self.val_loss_flag  = val_loss_flag
 
@@ -31,7 +31,7 @@ class LossHistory():
         os.makedirs(self.log_dir)
         self.writer     = SummaryWriter(self.log_dir)
         try:
-            dummy_input     = torch.randn(2, 3, input_shape[0], input_shape[1])
+            dummy_input     = torch.randn(2, input_channels, input_shape[0], input_shape[1])
             self.writer.add_graph(model, dummy_input)
         except:
             pass

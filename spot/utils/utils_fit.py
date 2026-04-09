@@ -257,6 +257,8 @@ def fit_one_epoch(
         return det_logit, noise_logit, final_logit
 
     def _noise_supervision_loss(noise_logit, noise_target):
+        if noise_logit.shape[1] > 1:
+            noise_logit = noise_logit[:, 1:2, :, :]
         noise_map = F.binary_cross_entropy_with_logits(noise_logit, noise_target, reduction='none')
         if stable_noise_weight is not None:
             stable_w = stable_noise_weight
