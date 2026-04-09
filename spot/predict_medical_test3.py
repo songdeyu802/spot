@@ -810,12 +810,15 @@ def main():
         resized_np_base = resized_np_base[..., 0]
 
     # 4. 多百分位预测融合
-    vote_map = np.zeros(old_disp.shape, dtype=np.uint16)          # final
-    vote_map_det = np.zeros(old_disp.shape, dtype=np.uint16)      # detector raw
+    final_vote_map = np.zeros(old_disp.shape, dtype=np.uint16)    # final
+    det_vote_map = np.zeros(old_disp.shape, dtype=np.uint16)      # detector raw
     noise_prob_sum = np.zeros(old_disp.shape, dtype=np.float32)   # noise prob
 
     for hp in HIGH_PERCENT_LIST:
         print(f"\nProcessing with high_percent = {hp} ...")
+        pred_mask_det = np.zeros(old_disp.shape, dtype=np.uint8)
+        pred_mask_final = np.zeros(old_disp.shape, dtype=np.uint8)
+        noise_prob = np.zeros(old_disp.shape, dtype=np.float32)
 
         image_data = normalize_16bit_image(resized_np_base, low_percent=1, high_percent=hp)
         image_data = np.expand_dims(image_data, axis=0)
@@ -856,23 +859,23 @@ def main():
             pred_mask_det = (det_prob > DET_THRESHOLD).astype(np.uint8)
             pred_mask_final = (final_prob > THRESHOLD).astype(np.uint8)
 
-        vote_map_det += pred_mask_det.astype(np.uint16)
-        vote_map += pred_mask_final.astype(np.uint16)
+        det_vote_map += pred_mask_det.astype(np.uint16)
+        final_vote_map += pred_mask_final.astype(np.uint16)
         noise_prob_sum += noise_prob
 
     # 保存投票热图
-    vote_vis = (vote_map.astype(np.float32) / max(len(HIGH_PERCENT_LIST), 1) * 255.0).astype(np.uint8)
+    vote_vis = (final_vote_map.astype(np.float32) / max(len(HIGH_PERCENT_LIST), 1) * 255.0).astype(np.uint8)
     Image.fromarray(vote_vis).save(os.path.join(SAVE_DIR, "vote_map.png"))
-    vote_vis_det = (vote_map_det.astype(np.float32) / max(len(HIGH_PERCENT_LIST), 1) * 255.0).astype(np.uint8)
+    vote_vis_det = (det_vote_map.astype(np.float32) / max(len(HIGH_PERCENT_LIST), 1) * 255.0).astype(np.uint8)
     Image.fromarray(vote_vis_det).save(os.path.join(SAVE_DIR, "vote_map_det.png"))
 
     # 根据投票图生成 final_mask
     if USE_VOTE_FUSION:
-        final_mask = (vote_map >= VOTE_THRESHOLD).astype(np.uint8)
-        det_mask = (vote_map_det >= VOTE_THRESHOLD).astype(np.uint8)
+        final_mask = (final_vote_map >= VOTE_THRESHOLD).astype(np.uint8)
+        det_mask = (det_vote_map >= VOTE_THRESHOLD).astype(np.uint8)
     else:
-        final_mask = (vote_map >= 1).astype(np.uint8)
-        det_mask = (vote_map_det >= 1).astype(np.uint8)
+        final_mask = (final_vote_map >= 1).astype(np.uint8)
+        det_mask = (det_vote_map >= 1).astype(np.uint8)
 
     noise_prob_avg = noise_prob_sum / max(len(HIGH_PERCENT_LIST), 1)
     noise_mask = (noise_prob_avg >= NOISE_THRESHOLD).astype(np.uint8)
