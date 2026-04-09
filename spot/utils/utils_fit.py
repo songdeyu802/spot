@@ -170,9 +170,7 @@ def fit_one_epoch(
         save_period,  # 每隔多少轮保存一次模型
         save_dir,  # 模型保存目录
         local_rank=0,  # 分布式训练时当前进程序号，默认 0
-        pos_weight=None, # 正样本权重，默认 8.0（用于 TinyObjectLoss）
-        noise_loss_weight = 0.3,  # 分支B(这里用aux1)的噪声监督权重
-        stable_noise_weight = None, # [H,W] 或 [1,H,W] 的稳定噪声权重图（可选）
+        pos_weight=None  # 正样本权重，默认 8.0（用于 TinyObjectLoss）
 ):
     # -----------------------------
     # 初始化 TinyObjectLoss
@@ -214,13 +212,12 @@ def fit_one_epoch(
         if iteration >= epoch_step:
             break
 
-        imgs, pngs, noise_gts, labels = batch
+        imgs, pngs, labels = batch
 
         with torch.no_grad():
             if cuda:
                 imgs = imgs.cuda(local_rank)
                 pngs = pngs.cuda(local_rank)
-                noise_gts = noise_gts.cuda(local_rank)
                 labels = labels.cuda(local_rank)
 
         optimizer.zero_grad()
@@ -244,24 +241,9 @@ def fit_one_epoch(
             aux2_loss = tiny_loss_fn(aux2, gt_ds2)
             aux3_loss = tiny_loss_fn(aux3, gt_ds3)
 
-            # 分支B噪声监督（使用 aux1 作为高分辨率分支）
-            noise_logits = aux1[:, 1:2, :, :] if aux1.shape[1] > 1 else aux1
-            noise_target = noise_gts.unsqueeze(1).float()
-            noise_loss_map = F.binary_cross_entropy_with_logits(noise_logits, noise_target, reduction='none')
-            if stable_noise_weight is not None:
-                stable_w = stable_noise_weight
-                if stable_w.dim() == 2:
-                    stable_w = stable_w.unsqueeze(0).unsqueeze(0)
-                elif stable_w.dim() == 3:
-                    stable_w = stable_w.unsqueeze(1)
-                stable_w = stable_w.to(noise_loss_map.device, dtype=noise_loss_map.dtype)
-                noise_loss = (noise_loss_map * stable_w).mean()
-            else:
-                noise_loss = noise_loss_map.mean()
-
             # 深监督权重分配：高分辨率权重越大
             # main: 1.0, aux1: 0.75, aux2: 0.20, aux3: 0.05
-            loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss + noise_loss_weight * noise_loss
+            loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss
 
             # 计算 f_score 指标
             with torch.no_grad():
@@ -289,22 +271,8 @@ def fit_one_epoch(
                 aux2_loss = tiny_loss_fn(aux2, gt_ds2)
                 aux3_loss = tiny_loss_fn(aux3, gt_ds3)
 
-                noise_logits = aux1[:, 1:2, :, :] if aux1.shape[1] > 1 else aux1
-                noise_target = noise_gts.unsqueeze(1).float()
-                noise_loss_map = F.binary_cross_entropy_with_logits(noise_logits, noise_target, reduction='none')
-                if stable_noise_weight is not None:
-                    stable_w = stable_noise_weight
-                    if stable_w.dim() == 2:
-                        stable_w = stable_w.unsqueeze(0).unsqueeze(0)
-                    elif stable_w.dim() == 3:
-                        stable_w = stable_w.unsqueeze(1)
-                    stable_w = stable_w.to(noise_loss_map.device, dtype=noise_loss_map.dtype)
-                    noise_loss = (noise_loss_map * stable_w).mean()
-                else:
-                    noise_loss = noise_loss_map.mean()
-
                 # 深监督权重分配
-                loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss + noise_loss_weight * noise_loss
+                loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss
 
                 with torch.no_grad():
                     _f_score = f_score(outputs, labels)
@@ -345,14 +313,12 @@ def fit_one_epoch(
         if iteration >= epoch_step_val:
             break
 
-        imgs, pngs, noise_gts, labels = batch
-
+        imgs, pngs, labels = batch
 
         with torch.no_grad():
             if cuda:
                 imgs = imgs.cuda(local_rank)
                 pngs = pngs.cuda(local_rank)
-                noise_gts = noise_gts.cuda(local_rank)
                 labels = labels.cuda(local_rank)
 
             outputs, aux1, aux2, aux3 = model_train(imgs)
@@ -368,21 +334,8 @@ def fit_one_epoch(
             aux2_loss = tiny_loss_fn(aux2, gt_ds2)
             aux3_loss = tiny_loss_fn(aux3, gt_ds3)
 
-            noise_logits = aux1[:, 1:2, :, :] if aux1.shape[1] > 1 else aux1
-            noise_target = noise_gts.unsqueeze(1).float()
-            noise_loss_map = F.binary_cross_entropy_with_logits(noise_logits, noise_target, reduction='none')
-            if stable_noise_weight is not None:
-                stable_w = stable_noise_weight
-                if stable_w.dim() == 2:
-                    stable_w = stable_w.unsqueeze(0).unsqueeze(0)
-                elif stable_w.dim() == 3:
-                    stable_w = stable_w.unsqueeze(1)
-                stable_w = stable_w.to(noise_loss_map.device, dtype=noise_loss_map.dtype)
-                noise_loss = (noise_loss_map * stable_w).mean()
-            else:
-                noise_loss = noise_loss_map.mean()
+            loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss
 
-            loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss + noise_loss_weight * noise_loss
             _f_score = f_score(outputs, labels)
 
             val_loss += loss.item()
@@ -437,21 +390,6 @@ def fit_one_epoch(
                 model.state_dict(),
                 os.path.join(save_dir, "best_epoch_weights.pth")
             )
-            if hasattr(model, "noise_branch"):
-                torch.save(
-                    model.noise_branch.state_dict(),
-                    os.path.join(save_dir, "noise_branch_best.pth")
-                )
-            if hasattr(model, "det_branch"):
-                torch.save(
-                    model.det_branch.state_dict(),
-                    os.path.join(save_dir, "det_branch_fixed.pth")
-                )
-            if hasattr(model, "fusion_alpha"):
-                torch.save(
-                    {"fusion_alpha": model.fusion_alpha.detach().cpu()},
-                    os.path.join(save_dir, "dual_fusion_best.pth")
-                )
 
         torch.save(
             model.state_dict(),
