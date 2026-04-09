@@ -357,7 +357,7 @@ if __name__ == "__main__":
     if local_rank == 0:
         time_str        = datetime.datetime.strftime(datetime.datetime.now(),'%Y_%m_%d_%H_%M_%S')
         log_dir         = os.path.join(save_dir, "loss_" + str(time_str))
-        loss_history = LossHistory(log_dir, model, input_shape=input_shape)
+        loss_history = LossHistory(log_dir, model, input_shape=input_shape, input_channels=1)
     else:
         loss_history = None
 
@@ -448,11 +448,16 @@ if __name__ == "__main__":
         #   根据optimizer_type选择优化器
         #---------------------------------------
 
-        trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-        optimizer = {
-            'adam': optim.Adam(trainable_params, Init_lr_fit, betas=(momentum, 0.999), weight_decay=weight_decay),
-            'sgd': optim.SGD(trainable_params, Init_lr_fit, momentum=momentum, nesterov=True, weight_decay=weight_decay)
-        }[optimizer_type]
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError(
+                "No trainable parameters found. "
+                "Please check freeze_detector/train_noise_branch/freeze settings."
+            )
+        if optimizer_type == 'adam':
+            optimizer = optim.Adam(trainable_params, Init_lr_fit, betas=(momentum, 0.999), weight_decay=weight_decay)
+        else:
+            optimizer = optim.SGD(trainable_params, Init_lr_fit, momentum=momentum, nesterov=True, weight_decay=weight_decay)
         #---------------------------------------#
         #   获得学习率下降的公式
         #---------------------------------------#
@@ -545,12 +550,14 @@ if __name__ == "__main__":
                     p.requires_grad = True
 
                 tiny_lr = Init_lr_fit * 0.1
-                fusion_params = filter(lambda p: p.requires_grad, model.parameters())
-                optimizer = {
-                    'adam': optim.Adam(fusion_params, tiny_lr, betas=(momentum, 0.999), weight_decay=weight_decay),
-                    'sgd': optim.SGD(fusion_params, tiny_lr, momentum=momentum, nesterov=True,
-                                     weight_decay=weight_decay)
-                }[optimizer_type]
+                fusion_params = [p for p in model.parameters() if p.requires_grad]
+                if len(fusion_params) == 0:
+                    raise ValueError("No trainable parameters found in phase-2 fusion fine-tuning.")
+                if optimizer_type == 'adam':
+                    optimizer = optim.Adam(fusion_params, tiny_lr, betas=(momentum, 0.999), weight_decay=weight_decay)
+                else:
+                    optimizer = optim.SGD(fusion_params, tiny_lr, momentum=momentum, nesterov=True,
+                                          weight_decay=weight_decay)
                 lr_scheduler_func = get_lr_scheduler(lr_decay_type, tiny_lr, tiny_lr * 0.1, UnFreeze_Epoch)
 
             UnFreeze_flag = True

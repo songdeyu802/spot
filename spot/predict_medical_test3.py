@@ -7,7 +7,7 @@ from PIL import Image
 import torch
 import cv2
 from skimage.morphology import binary_erosion, disk
-from nets.unet import Unet
+from nets.unet import Unet, DualBranchUnet
 from scipy.linalg import svd
 from scipy.optimize import linear_sum_assignment
 import itertools
@@ -27,12 +27,15 @@ GT_MASK_PATH = "E:/unet-pytorch-main/Medical_Datasets/Labels/image_51.png"
 SAVE_DIR = "pred_results"
 BACKBONE = "myunet"
 NUM_CLASSES = 2
+USE_DUAL_BRANCH = True
 # 使用正方形输入，减少边缘漏检
 INPUT_SHAPE = [720, 720]  # [height, width]
 CUDA = True
 
 # 单次预测阈值
 THRESHOLD = 0.8
+DET_THRESHOLD = 0.7
+NOISE_THRESHOLD = 0.5
 
 # 圆形度阈值
 MIN_CIRCULARITY = 0.6
@@ -757,7 +760,16 @@ def main():
     print("=================\n")
 
     # 1. 加载模型
-    model = Unet(num_classes=NUM_CLASSES, pretrained=False, backbone=BACKBONE)
+    if USE_DUAL_BRANCH:
+        model = DualBranchUnet(
+            num_classes=NUM_CLASSES,
+            det_backbone=BACKBONE,
+            det_pretrained=False,
+            use_unet_dna=True,
+            fusion_alpha_init=1.0
+        )
+    else:
+        model = Unet(num_classes=NUM_CLASSES, pretrained=False, backbone=BACKBONE)
     state_dict = torch.load(MODEL_PATH, map_location=device)
     model.load_state_dict(state_dict)
     model = model.to(device)
@@ -798,7 +810,9 @@ def main():
         resized_np_base = resized_np_base[..., 0]
 
     # 4. 多百分位预测融合
-    vote_map = np.zeros(old_disp.shape, dtype=np.uint16)
+    vote_map = np.zeros(old_disp.shape, dtype=np.uint16)          # final
+    vote_map_det = np.zeros(old_disp.shape, dtype=np.uint16)      # detector raw
+    noise_prob_sum = np.zeros(old_disp.shape, dtype=np.float32)   # noise prob
 
     for hp in HIGH_PERCENT_LIST:
         print(f"\nProcessing with high_percent = {hp} ...")
@@ -809,32 +823,64 @@ def main():
 
         with torch.no_grad():
             images = torch.from_numpy(image_data).float().to(device)
-            outputs, _, _, _ = model(images)
-            probs = torch.softmax(outputs, dim=1)[0, 1].cpu().numpy()
+            if USE_DUAL_BRANCH:
+                det_out = model.det_branch(images)
+                det_logit = det_out[0] if isinstance(det_out, (list, tuple)) else det_out
+                noise_logit = model.noise_branch(images)
+                final_logit = model._fuse(det_logit, noise_logit)
+            else:
+                model_out = model(images)
+                final_logit = model_out[0] if isinstance(model_out, (list, tuple)) else model_out
+                det_logit = final_logit
+                noise_logit = torch.zeros_like(final_logit[:, :1, :, :])
+
+            det_prob = torch.softmax(det_logit, dim=1)[0, 1].cpu().numpy()
+            final_prob = torch.softmax(final_logit, dim=1)[0, 1].cpu().numpy()
+            noise_prob = torch.sigmoid(noise_logit)[0, 0].cpu().numpy()
 
             # 裁掉padding区域
-            probs = probs[dy:dy + nh, dx:dx + nw]
+            det_prob = det_prob[dy:dy + nh, dx:dx + nw]
+            final_prob = final_prob[dy:dy + nh, dx:dx + nw]
+            noise_prob = noise_prob[dy:dy + nh, dx:dx + nw]
 
             # resize回原图大小
-            probs_img = Image.fromarray((probs * 255).astype(np.uint8))
-            probs_img = probs_img.resize(old_image.size, Image.BICUBIC)
-            probs = np.array(probs_img, dtype=np.float32) / 255.0
+            def _resize_to_orig(prob_map):
+                prob_img = Image.fromarray((prob_map * 255).astype(np.uint8))
+                prob_img = prob_img.resize(old_image.size, Image.BICUBIC)
+                return np.array(prob_img, dtype=np.float32) / 255.0
 
-            pred_mask = (probs > THRESHOLD).astype(np.uint8)
+            det_prob = _resize_to_orig(det_prob)
+            final_prob = _resize_to_orig(final_prob)
+            noise_prob = _resize_to_orig(noise_prob)
 
-        vote_map += pred_mask.astype(np.uint16)
+            pred_mask_det = (det_prob > DET_THRESHOLD).astype(np.uint8)
+            pred_mask_final = (final_prob > THRESHOLD).astype(np.uint8)
+
+        vote_map_det += pred_mask_det.astype(np.uint16)
+        vote_map += pred_mask_final.astype(np.uint16)
+        noise_prob_sum += noise_prob
 
     # 保存投票热图
     vote_vis = (vote_map.astype(np.float32) / max(len(HIGH_PERCENT_LIST), 1) * 255.0).astype(np.uint8)
     Image.fromarray(vote_vis).save(os.path.join(SAVE_DIR, "vote_map.png"))
+    vote_vis_det = (vote_map_det.astype(np.float32) / max(len(HIGH_PERCENT_LIST), 1) * 255.0).astype(np.uint8)
+    Image.fromarray(vote_vis_det).save(os.path.join(SAVE_DIR, "vote_map_det.png"))
 
     # 根据投票图生成 final_mask
     if USE_VOTE_FUSION:
         final_mask = (vote_map >= VOTE_THRESHOLD).astype(np.uint8)
+        det_mask = (vote_map_det >= VOTE_THRESHOLD).astype(np.uint8)
     else:
         final_mask = (vote_map >= 1).astype(np.uint8)
+        det_mask = (vote_map_det >= 1).astype(np.uint8)
+
+    noise_prob_avg = noise_prob_sum / max(len(HIGH_PERCENT_LIST), 1)
+    noise_mask = (noise_prob_avg >= NOISE_THRESHOLD).astype(np.uint8)
 
     cv2.imwrite(os.path.join(SAVE_DIR, "step0_vote_fused.png"), final_mask * 255)
+    cv2.imwrite(os.path.join(SAVE_DIR, "det_raw_mask.png"), det_mask * 255)
+    cv2.imwrite(os.path.join(SAVE_DIR, "noise_mask.png"), noise_mask * 255)
+    cv2.imwrite(os.path.join(SAVE_DIR, "final_minus_noise_mask.png"), final_mask * 255)
 
     # 5. 圆形度过滤（可选）
     # final_mask = filter_by_circularity(final_mask, min_circularity=MIN_CIRCULARITY)
@@ -1097,9 +1143,23 @@ def main():
     Image.fromarray(mask_save).save(os.path.join(SAVE_DIR, "final_mask.png"))
     Image.fromarray(old_disp).save(os.path.join(SAVE_DIR, "original.png"))
 
+    overlay_det = old_rgb.copy()
+    overlay_det[det_mask == 1] = [255, 255, 0]
+    Image.fromarray(overlay_det).save(os.path.join(SAVE_DIR, "overlay_det_raw.png"))
+
     overlay = old_rgb.copy()
     overlay[final_mask == 1] = [255, 0, 0]
     Image.fromarray(overlay).save(os.path.join(SAVE_DIR, "overlay_final.png"))
+
+    if GT_MASK_PATH is not None and os.path.exists(GT_MASK_PATH):
+        gt_mask_for_vis = load_binary_mask(GT_MASK_PATH, target_size=old_image.size)
+        if gt_mask_for_vis is not None:
+            gt_mask_for_vis = (gt_mask_for_vis > 0).astype(np.uint8)
+            compare_rgb = old_rgb.copy()
+            compare_rgb[(det_mask == 1) & (gt_mask_for_vis == 1)] = [0, 255, 0]      # TP
+            compare_rgb[(det_mask == 1) & (gt_mask_for_vis == 0)] = [255, 0, 0]      # FP
+            compare_rgb[(det_mask == 0) & (gt_mask_for_vis == 1)] = [0, 0, 255]      # FN
+            Image.fromarray(compare_rgb).save(os.path.join(SAVE_DIR, "compare_det_gt.png"))
 
     print(f"\n预测完成，结果保存在：{SAVE_DIR}")
     print("生成的文件:")

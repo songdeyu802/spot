@@ -101,6 +101,16 @@ class Unet(object):
             return prediction[0]
         return prediction
 
+    def _build_input_tensor(self, image_data):
+        image_arr = np.array(image_data, np.float32)
+        if self.backbone == "myunet":
+            if image_arr.ndim == 3:
+                image_arr = image_arr[..., 0]
+            image_arr = preprocess_input(image_arr)
+            return np.expand_dims(np.expand_dims(image_arr, 0), 0)
+        image_arr = preprocess_input(image_arr)
+        return np.expand_dims(np.transpose(image_arr, (2, 0, 1)), 0)
+
     #---------------------------------------------------#
     #   检测图片
     #---------------------------------------------------#
@@ -124,7 +134,7 @@ class Unet(object):
         #---------------------------------------------------------#
         #   添加上batch_size维度
         #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        image_data  = self._build_input_tensor(image_data)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)
@@ -235,7 +245,7 @@ class Unet(object):
         #---------------------------------------------------------#
         #   添加上batch_size维度
         #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        image_data  = self._build_input_tensor(image_data)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)
@@ -330,7 +340,7 @@ class Unet(object):
         #---------------------------------------------------------#
         #   添加上batch_size维度
         #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        image_data  = self._build_input_tensor(image_data)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)

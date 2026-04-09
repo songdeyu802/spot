@@ -94,6 +94,7 @@ class UnetDataset(Dataset):
 
             jpg = jpg[:, y1:y2, x1:x2]
             modify_png = modify_png[y1:y2, x1:x2]
+            noise_gt = noise_gt[y1:y2, x1:x2]
 
         # one-hot 标签，注意尺寸不能再写死 input_shape
         h, w = modify_png.shape
@@ -145,6 +146,7 @@ class UnetDataset(Dataset):
         nh = int(ih * scale)
         image = image.resize((nw, nh), Image.BICUBIC)
         label = label.resize((nw, nh), Image.NEAREST)
+        noise_label = noise_label.resize((nw, nh), Image.NEAREST)
 
         # —— 90° 旋转 —— #
         angle = np.random.choice([0, 90, 180, 270])
@@ -159,8 +161,8 @@ class UnetDataset(Dataset):
             noise_label = noise_label.transpose(Image.FLIP_LEFT_RIGHT)
 
         # —— 随机平移并填充背景 —— #
-        dx = int(self.rand(0, w - nw))
-        dy = int(self.rand(0, h - nh))
+        dx = int(self.rand(min(0, w - nw), max(0, w - nw)))
+        dy = int(self.rand(min(0, h - nh), max(0, h - nh)))
         new_img = Image.new('I;16', (w, h), 0)
         new_lbl = Image.new('L', (w, h), 0)
         new_noise_lbl = Image.new('L', (w, h), 0)
