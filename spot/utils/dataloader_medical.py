@@ -23,7 +23,7 @@ def normalize_16bit_image(img, low_percent=1, high_percent=99.5):
 
 class UnetDataset(Dataset):
     def __init__(self, annotation_lines, input_shape, num_classes, train, dataset_path, use_patch=False,
-                 patch_size=128):
+                 patch_size=128, noise_label_dir="NoiseLabels"):
         super(UnetDataset, self).__init__()
         self.annotation_lines = annotation_lines
         self.length = len(annotation_lines)
@@ -33,6 +33,7 @@ class UnetDataset(Dataset):
         self.dataset_path = dataset_path
         self.use_patch = use_patch
         self.patch_size = patch_size
+        self.noise_label_dir = noise_label_dir
 
     def __len__(self):
         return self.length
@@ -46,8 +47,13 @@ class UnetDataset(Dataset):
         # -------------------------------#
         jpg = Image.open(os.path.join(os.path.join(self.dataset_path, "Images"), name + ".png"))
         png = Image.open(os.path.join(os.path.join(self.dataset_path, "Labels"), name + ".png"))
+        noise_png_path = os.path.join(self.dataset_path, self.noise_label_dir, name + ".png")
+        if os.path.exists(noise_png_path):
+            noise_png = Image.open(noise_png_path)
+        else:
+            noise_png = Image.new("L", png.size, 0)
 
-        jpg, png = self.get_random_data(jpg, png, self.input_shape, random=self.train)
+        jpg, png, noise_png = self.get_random_data(jpg, png, noise_png, self.input_shape, random=self.train)
 
         # 转成 numpy
         jpg = np.array(jpg, dtype=np.uint16)
@@ -62,6 +68,7 @@ class UnetDataset(Dataset):
 
         # 标签二值化
         modify_png = (png > 0).astype(np.uint8)
+        noise_gt = (np.array(noise_png) > 0).astype(np.uint8)
 
         # patch 裁剪
         if self.use_patch:
@@ -93,13 +100,13 @@ class UnetDataset(Dataset):
         # 将2D标签展平，转为one-hot，再reshape
         seg_labels = np.eye(self.num_classes, dtype=np.float32)[modify_png.reshape([-1])]
         seg_labels = seg_labels.reshape((h, w, self.num_classes))
-        print(f"[Dataset] jpg.shape = {jpg.shape}")  # 期望 (1, H, W)
-        return jpg, modify_png, seg_labels
+        return jpg, modify_png, noise_gt, seg_labels
+
 
     def rand(self, a=0, b=1):
         return np.random.rand() * (b - a) + a
 
-    def get_random_data(self, image, label, input_shape, jitter=0.05, random=True):
+    def get_random_data(self, image, label, noise_label, input_shape, jitter=0.05, random=True):
         # """
         # 专为彩色星点图像设计的数据增强：
         # - 微幅缩放（±5%）
@@ -112,6 +119,7 @@ class UnetDataset(Dataset):
         # 保留原始步骤
         image = Image.fromarray(np.array(image, dtype=np.uint16))
         label = Image.fromarray(np.array(label))
+        noise_label = Image.fromarray(np.array(noise_label))
 
         iw, ih = image.size
         h, w = input_shape
@@ -125,9 +133,11 @@ class UnetDataset(Dataset):
 
             new_img = Image.new('I;16', (w, h), 0)
             new_lbl = Image.new('L', (w, h), 0)
+            new_noise_lbl = Image.new('L', (w, h), 0)
             new_img.paste(image, ((w - nw) // 2, (h - nh) // 2))
             new_lbl.paste(label, ((w - nw) // 2, (h - nh) // 2))
-            return new_img, new_lbl
+            new_noise_lbl.paste(noise_label, ((w - nw) // 2, (h - nh) // 2))
+            return new_img, new_lbl, new_noise_lbl
 
         # —— 微幅缩放 —— #
         scale = self.rand(1 - jitter, 1 + jitter)  # ±5%
@@ -140,19 +150,23 @@ class UnetDataset(Dataset):
         angle = np.random.choice([0, 90, 180, 270])
         image = image.rotate(angle)
         label = label.rotate(angle)
+        noise_label = noise_label.rotate(angle)
 
         # —— 随机水平翻转 —— #
         if self.rand() < 0.5:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
             label = label.transpose(Image.FLIP_LEFT_RIGHT)
+            noise_label = noise_label.transpose(Image.FLIP_LEFT_RIGHT)
 
         # —— 随机平移并填充背景 —— #
         dx = int(self.rand(0, w - nw))
         dy = int(self.rand(0, h - nh))
         new_img = Image.new('I;16', (w, h), 0)
         new_lbl = Image.new('L', (w, h), 0)
+        new_noise_lbl = Image.new('L', (w, h), 0)
         new_img.paste(image, (dx, dy))
         new_lbl.paste(label, (dx, dy))
+        new_noise_lbl.paste(noise_label, (dx, dy))
 
         img_np = np.array(new_img, dtype=np.float32)
 
@@ -165,7 +179,7 @@ class UnetDataset(Dataset):
             img_np = np.clip(img_np + noise, 0, 65535)
 
         final_img = Image.fromarray(img_np.astype(np.uint16))
-        return final_img, new_lbl
+        return final_img, new_lbl, new_noise_lbl
 
     # def get_random_data(self, image, label, input_shape, jitter=.3, hue=.1, sat=0.7, val=0.3, random=True):
     #     image   = cvtColor(image)
@@ -250,17 +264,18 @@ class UnetDataset(Dataset):
     #     return image_data, label
 
 
-# DataLoader中collate_fn使用
 def unet_dataset_collate(batch):
     images = []
     pngs = []
+    noise_gts = []
     seg_labels = []
-    for img, png, labels in batch:
+    for img, png, noise_gt, labels in batch:
         images.append(img)
         pngs.append(png)
+        noise_gts.append(noise_gt)
         seg_labels.append(labels)
     images = torch.from_numpy(np.array(images)).type(torch.FloatTensor)
     pngs = torch.from_numpy(np.array(pngs)).long()
+    noise_gts = torch.from_numpy(np.array(noise_gts)).float()
     seg_labels = torch.from_numpy(np.array(seg_labels)).type(torch.FloatTensor)
-    print(f"[Collate] images.shape = {images.shape}")  # 期望 (batch, 1, H, W)
-    return images, pngs, seg_labels
+    return images, pngs, noise_gts, seg_labels

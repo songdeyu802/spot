@@ -353,6 +353,81 @@ class Unet(nn.Module):
             for param in self.resnet.parameters():
                 param.requires_grad = True
 
+
+class NoiseSuppressionBranch(nn.Module):
+    def __init__(self, in_channels=1, base_channels=32, out_channels=1):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.down = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True)
+        )
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.head = nn.Conv2d(base_channels * 2, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.encoder(x)
+        b = self.bottleneck(self.down(e1))
+        u = self.up(b)
+        return self.head(torch.cat([u, e1], dim=1))
+
+
+class DualBranchUnet(nn.Module):
+    def __init__(
+        self,
+        num_classes=1,
+        det_backbone='myunet',
+        det_pretrained=False,
+        use_unet_dna=True,
+        fusion_alpha_init=1.0
+    ):
+        super().__init__()
+        if use_unet_dna:
+            self.det_branch = Unet_DNA(num_classes=num_classes, deep_supervision=True)
+        else:
+            self.det_branch = Unet(num_classes=num_classes, pretrained=det_pretrained, backbone=det_backbone)
+        self.noise_branch = NoiseSuppressionBranch(in_channels=1, base_channels=32, out_channels=num_classes)
+        self.fusion_alpha = nn.Parameter(torch.tensor(float(fusion_alpha_init)))
+        self.noise_act = nn.Sigmoid()
+
+    def _fuse(self, det_logit, noise_logit):
+        return det_logit - self.fusion_alpha * self.noise_act(noise_logit)
+
+    def forward(self, x):
+        det_outputs = self.det_branch(x)
+        if isinstance(det_outputs, tuple):
+            det_main, *det_aux = det_outputs
+        else:
+            det_main, det_aux = det_outputs, []
+
+        noise_main = self.noise_branch(x)
+        final_main = self._fuse(det_main, noise_main)
+
+        if not det_aux:
+            return final_main, final_main, final_main, final_main
+
+        fused_aux = []
+        for aux_logit in det_aux:
+            resized_noise = F.interpolate(noise_main, size=aux_logit.shape[2:], mode='bilinear', align_corners=False)
+            fused_aux.append(self._fuse(aux_logit, resized_noise))
+        return (final_main, *fused_aux)
 # class unetUp(nn.Module):
 #     def __init__(self, in_size, out_size):
 #         super(unetUp, self).__init__()

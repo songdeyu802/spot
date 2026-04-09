@@ -9,8 +9,10 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from PIL import Image
 
-from nets.unet import Unet
+from nets.unet import DualBranchUnet
 from nets.unet_training import get_lr_scheduler, set_optimizer_lr, weights_init
 
 from utils.callbacks import  EvalCallback, LossHistory
@@ -112,7 +114,10 @@ if __name__ == "__main__":
     #----------------------------------------------------------------------------------------------------------------------------#
     model_path  = ""
     #model_path = "logs/best_epoch_weights.pth"
-
+    detector_ckpt = "logs/best_epoch_weights.pth"
+    freeze_detector = True
+    train_noise_branch = True
+    fusion_alpha_init = 1.0
     #-----------------------------------------------------#
     #   input_shape     输入图片的大小，32的倍数
     #-----------------------------------------------------#
@@ -217,6 +222,10 @@ if __name__ == "__main__":
     #   数据集路径
     #------------------------------#
     VOCdevkit_path  = 'Medical_Datasets'
+    noise_label_dir = "NoiseLabels"
+    stable_noise_map_path = os.path.join(VOCdevkit_path, noise_label_dir, "stable_noise_map.png")
+    noise_loss_weight = 0.3
+    stable_noise_boost = 2.0
     #------------------------------------------------------------------#
     #   建议选项：
     #   种类少（几类）时，设置为True
@@ -274,9 +283,15 @@ if __name__ == "__main__":
         else:
             download_weights(backbone)
 
-    model = Unet(num_classes=num_classes, pretrained=pretrained, backbone=backbone).train()
-    if not pretrained:
-        weights_init(model)
+    model = DualBranchUnet(
+        num_classes=num_classes,
+        det_backbone=backbone,
+        det_pretrained=pretrained,
+        use_unet_dna=True,
+        fusion_alpha_init=fusion_alpha_init
+    ).train()
+    weights_init(model.noise_branch)
+
     if model_path != '':
         #------------------------------------------------------#
         #   权值文件请看README，百度网盘下载
@@ -305,6 +320,36 @@ if __name__ == "__main__":
             print("\nSuccessful Load Key:", str(load_key)[:500], "……\nSuccessful Load Key Num:", len(load_key))
             print("\nFail To Load Key:", str(no_load_key)[:500], "……\nFail To Load Key num:", len(no_load_key))
             print("\n\033[1;33;44m温馨提示，head部分没有载入是正常现象，Backbone部分没有载入是错误的。\033[0m")
+
+    if detector_ckpt and os.path.isfile(detector_ckpt):
+        if local_rank == 0:
+            print('Load detector branch from {}.'.format(detector_ckpt))
+        det_state_dict = model.det_branch.state_dict()
+        pretrained_dict = torch.load(detector_ckpt, map_location=device)
+        load_key, no_load_key, temp_dict = [], [], {}
+        for k, v in pretrained_dict.items():
+            if k.startswith("module."):
+                k = k[len("module."):]
+            det_key = k.replace("net.", "", 1) if k.startswith("net.") else k
+            if det_key in det_state_dict.keys() and np.shape(det_state_dict[det_key]) == np.shape(v):
+                temp_dict[det_key] = v
+                load_key.append(det_key)
+            else:
+                no_load_key.append(k)
+        det_state_dict.update(temp_dict)
+        model.det_branch.load_state_dict(det_state_dict)
+        if local_rank == 0:
+            print("\nDetector Loaded Key Num:", len(load_key))
+            print("\nDetector Failed Key num:", len(no_load_key))
+    elif local_rank == 0:
+        print("Detector checkpoint not found, skip loading: {}".format(detector_ckpt))
+
+    if freeze_detector:
+        for p in model.det_branch.parameters():
+            p.requires_grad = False
+    if not train_noise_branch:
+        for p in model.noise_branch.parameters():
+            p.requires_grad = False
 
     #----------------------#
     #   记录Loss
@@ -382,7 +427,7 @@ if __name__ == "__main__":
         #------------------------------------#
         #   冻结一定部分训练
         #------------------------------------#
-        if Freeze_Train:
+        if Freeze_Train and hasattr(model, "freeze_backbone"):
             model.freeze_backbone()
                 
         #-------------------------------------------------------------------#
@@ -402,9 +447,10 @@ if __name__ == "__main__":
         #---------------------------------------#
         #   根据optimizer_type选择优化器
         #---------------------------------------#
+        trainable_params = filter(lambda p: p.requires_grad, model.parameters())
         optimizer = {
-            'adam'  : optim.Adam(model.parameters(), Init_lr_fit, betas = (momentum, 0.999), weight_decay = weight_decay),
-            'sgd'   : optim.SGD(model.parameters(), Init_lr_fit, momentum = momentum, nesterov=True, weight_decay = weight_decay)
+            'adam': optim.Adam(trainable_params, Init_lr_fit, betas=(momentum, 0.999), weight_decay=weight_decay),
+            'sgd': optim.SGD(trainable_params, Init_lr_fit, momentum=momentum, nesterov=True, weight_decay=weight_decay)
         }[optimizer_type]
 
         #---------------------------------------#
@@ -426,12 +472,25 @@ if __name__ == "__main__":
         # 训练集：使用 patch 裁剪
         train_dataset = UnetDataset(
             train_lines, input_shape, num_classes, True, VOCdevkit_path,
-            use_patch=True, patch_size=128
+            use_patch=True, patch_size=128, noise_label_dir=noise_label_dir
         )
         val_dataset = UnetDataset(
             val_lines, input_shape, num_classes, False, VOCdevkit_path,
-            use_patch=False
+            use_patch=False, noise_label_dir=noise_label_dir
         )
+
+        stable_noise_weight = None
+        if os.path.exists(stable_noise_map_path):
+            stable_map = torch.from_numpy((np.array(Image.open(stable_noise_map_path)) > 0).astype(np.float32))
+            stable_noise_weight = 1.0 + (stable_noise_boost - 1.0) * stable_map
+            if stable_noise_weight.shape[-2:] != tuple(input_shape):
+                stable_noise_weight = F.interpolate(
+                    stable_noise_weight.unsqueeze(0).unsqueeze(0),
+                    size=tuple(input_shape),
+                    mode="nearest"
+                ).squeeze(0).squeeze(0)
+            if local_rank == 0:
+                print(f"Loaded stable noise map from: {stable_noise_map_path}")
 
         if distributed:
             train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
@@ -476,37 +535,25 @@ if __name__ == "__main__":
             #   如果模型有冻结学习部分
             #   则解冻，并设置参数
             #---------------------------------------#
-            if epoch >= Freeze_Epoch and not UnFreeze_flag and Freeze_Train:
-                batch_size = Unfreeze_batch_size
+            if epoch >= Freeze_Epoch and not UnFreeze_flag:
+                # 阶段2：仅微调融合头（不更新检测分支）
+                for p in model.det_branch.parameters():
+                    p.requires_grad = False
+                for p in model.noise_branch.parameters():
+                    p.requires_grad = False
+                for p in [model.fusion_alpha]:
+                    p.requires_grad = True
 
-                #-------------------------------------------------------------------#
-                #   判断当前batch_size，自适应调整学习率
-                #-------------------------------------------------------------------#
-                nbs             = 16
-                lr_limit_max    = 1e-4 if optimizer_type == 'adam' else 1e-1
-                lr_limit_min    = 1e-4 if optimizer_type == 'adam' else 5e-4
-                Init_lr_fit     = min(max(batch_size / nbs * Init_lr, lr_limit_min), lr_limit_max)
-                Min_lr_fit      = min(max(batch_size / nbs * Min_lr, lr_limit_min * 1e-2), lr_limit_max * 1e-2)
-                #---------------------------------------#
-                #   获得学习率下降的公式
-                #---------------------------------------#
-                lr_scheduler_func = get_lr_scheduler(lr_decay_type, Init_lr_fit, Min_lr_fit, UnFreeze_Epoch)
-                    
-                model.unfreeze_backbone()
-                            
-                epoch_step      = num_train // batch_size
+                tiny_lr = Init_lr_fit * 0.1
+                fusion_params = filter(lambda p: p.requires_grad, model.parameters())
+                optimizer = {
+                    'adam': optim.Adam(fusion_params, tiny_lr, betas=(momentum, 0.999), weight_decay=weight_decay),
+                    'sgd': optim.SGD(fusion_params, tiny_lr, momentum=momentum, nesterov=True,
+                                     weight_decay=weight_decay)
+                }[optimizer_type]
+                lr_scheduler_func = get_lr_scheduler(lr_decay_type, tiny_lr, tiny_lr * 0.1, UnFreeze_Epoch)
 
-                if epoch_step == 0:
-                    raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
-
-                if distributed:
-                    batch_size = batch_size // ngpus_per_node
-
-                gen             = DataLoader(train_dataset, shuffle = shuffle, batch_size = batch_size, num_workers = num_workers, pin_memory=True,
-                                            drop_last = True, collate_fn = unet_dataset_collate, sampler=train_sampler, 
-                                            worker_init_fn=partial(worker_init_fn, rank=rank, seed=seed))
-
-                UnFreeze_flag = True
+            UnFreeze_flag = True
 
             if distributed:
                 train_sampler.set_epoch(epoch)
@@ -517,7 +564,9 @@ if __name__ == "__main__":
                 model_train, model, loss_history, eval_callback, optimizer, epoch,
                 epoch_step, epoch_step_val, gen, gen_val, UnFreeze_Epoch, Cuda,
                 dice_loss, focal_loss, cls_weights, num_classes, fp16, scaler,
-                save_period, save_dir, local_rank
+                save_period, save_dir, local_rank,
+                noise_loss_weight=noise_loss_weight,
+                stable_noise_weight=stable_noise_weight
             )
             if distributed:
                 dist.barrier()
