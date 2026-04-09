@@ -275,18 +275,35 @@ class Unet(nn.Module):
             # 保留原有的 VGG 和 ResNet50 分支
             if backbone == 'vgg':
                 self.vgg = VGG16(pretrained=pretrained)
-                in_filters = [192, 384, 768, 1024]
+                decoder_in_channels = [128, 256, 512, 512]
+                skip_channels = [64, 128, 256, 512]
             elif backbone == 'resnet50':
                 self.resnet = resnet50(pretrained=pretrained)
-                in_filters = [192, 512, 1024, 3072]
+                decoder_in_channels = [128, 256, 512, 2048]
+                skip_channels = [64, 256, 512, 1024]
             out_filters = [64, 128, 256, 512]
 
-            self.up_concat4 = UnetUp(in_filters[3], out_filters[3])
-            self.up_concat3 = UnetUp(in_filters[2], out_filters[2])
-            self.up_concat2 = UnetUp(in_filters[1], out_filters[1])
-            self.up_concat1 = UnetUp(in_filters[0], out_filters[0])
-
-            if backbone == 'resnet50':
+            self.up_concat4 = UnetUp(
+                in_channels=decoder_in_channels[3],
+                skip_channels=skip_channels[3],
+                out_channels=out_filters[3]
+            )
+            self.up_concat3 = UnetUp(
+                in_channels=decoder_in_channels[2],
+                skip_channels=skip_channels[2],
+                out_channels=out_filters[2]
+            )
+            self.up_concat2 = UnetUp(
+                in_channels=decoder_in_channels[1],
+                skip_channels=skip_channels[1],
+                out_channels=out_filters[1]
+            )
+            self.up_concat1 = UnetUp(
+                in_channels=decoder_in_channels[0],
+                skip_channels=skip_channels[0],
+                out_channels=out_filters[0]
+            )
+            if backbone == 'resnet50':      # ← 这里缩进应与上面的 if/elif 对齐（少缩进一级）
                 self.up_conv = nn.Sequential(
                     nn.UpsamplingBilinear2d(scale_factor=2),
                     nn.Conv2d(out_filters[0], out_filters[0], kernel_size=3, padding=1),
@@ -299,7 +316,7 @@ class Unet(nn.Module):
 
             self.final = nn.Conv2d(out_filters[0], num_classes, 1)
 
-        self.backbone = backbone
+            self.backbone = backbone
 
     def forward(self, inputs):
         if self.backbone == 'myunet':
@@ -310,10 +327,11 @@ class Unet(nn.Module):
             elif self.backbone == 'resnet50':
                 [feat1, feat2, feat3, feat4, feat5] = self.resnet.forward(inputs)
 
-            up4 = self.up_concat4(feat4, feat5)
-            up3 = self.up_concat3(feat3, up4)
-            up2 = self.up_concat2(feat2, up3)
-            up1 = self.up_concat1(feat1, up2)
+
+            up4 = self.up_concat4(feat5, feat4)
+            up3 = self.up_concat3(up4, feat3)
+            up2 = self.up_concat2(up3, feat2)
+            up1 = self.up_concat1(up2, feat1)
 
             if self.up_conv is not None:
                 up1 = self.up_conv(up1)

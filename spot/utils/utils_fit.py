@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 import os
+import numpy as np
+from PIL import Image
 from nets.unet_training import CE_Loss, Dice_loss, Focal_Loss, FG_BCE_Loss
 
 # tqdm 用来显示进度条
@@ -170,7 +172,12 @@ def fit_one_epoch(
         save_period,  # 每隔多少轮保存一次模型
         save_dir,  # 模型保存目录
         local_rank=0,  # 分布式训练时当前进程序号，默认 0
-        pos_weight=None  # 正样本权重，默认 8.0（用于 TinyObjectLoss）
+        pos_weight=None, # 正样本权重，默认 8.0（用于 TinyObjectLoss）
+        noise_loss_weight=0.3,  # 分支B噪声监督权重 (w_noise)
+        fuse_loss_weight=1.0,  # 融合输出监督权重 (w_fuse)
+        sparse_reg_weight=0.05,  # 稀疏约束权重 (w_reg)
+        det_loss_weight=0.2,  # 分支A检测监督权重（冻结时自动不回传）
+        stable_noise_weight=None,  # [H,W] 或 [1,H,W] 的稳定噪声权重图（可选）
 ):
     # -----------------------------
     # 初始化 TinyObjectLoss
@@ -191,8 +198,88 @@ def fit_one_epoch(
     # -----------------------------
     total_loss = 0
     total_f_score = 0
+    total_loss_noise = 0
+    total_loss_fuse = 0
+    total_loss_det = 0
+    total_loss_sparse = 0
     val_loss = 0
     val_f_score = 0
+    val_loss_noise = 0
+    val_loss_fuse = 0
+    val_loss_det = 0
+    val_loss_sparse = 0
+
+    vis_dir = os.path.join(save_dir, "logs", "val_vis")
+    if local_rank == 0:
+        os.makedirs(vis_dir, exist_ok=True)
+
+    def _core_model(net):
+        return net.module if hasattr(net, "module") else net
+
+    def _to_prob_uint8(logits):
+        if logits.shape[1] > 1:
+            logits = logits[:, 1:2, :, :]
+        prob = torch.sigmoid(logits)[0, 0].detach().float().cpu().numpy()
+        return (np.clip(prob, 0, 1) * 255).astype(np.uint8)
+
+    def _save_vis(det_logit, noise_logit, final_logit, ep, it):
+        if local_rank != 0:
+            return
+        det_img = Image.fromarray(_to_prob_uint8(det_logit))
+        noise_img = Image.fromarray(_to_prob_uint8(noise_logit))
+        final_img = Image.fromarray(_to_prob_uint8(final_logit))
+        det_img.save(os.path.join(vis_dir, f"ep{ep + 1:03d}_it{it:04d}_det.png"))
+        noise_img.save(os.path.join(vis_dir, f"ep{ep + 1:03d}_it{it:04d}_noise.png"))
+        final_img.save(os.path.join(vis_dir, f"ep{ep + 1:03d}_it{it:04d}_final.png"))
+
+    def _forward_dual_branch(net, x):
+        core = _core_model(net)
+        if hasattr(core, "det_branch") and hasattr(core, "noise_branch"):
+            det_outputs = core.det_branch(x)
+            det_logit = det_outputs[0] if isinstance(det_outputs, tuple) else det_outputs
+            noise_logit = core.noise_branch(x)
+            if hasattr(core, "_fuse"):
+                final_logit = core._fuse(det_logit, noise_logit)
+            else:
+                final_logit = det_logit - core.fusion_alpha * torch.sigmoid(noise_logit)
+            return det_logit, noise_logit, final_logit
+
+        # 兼容非双分支模型：沿用现有输出格式
+        outputs = net(x)
+        if isinstance(outputs, tuple):
+            final_logit = outputs[0]
+            det_logit = outputs[1] if len(outputs) > 1 else outputs[0]
+            noise_logit = outputs[2] if len(outputs) > 2 else outputs[0]
+        else:
+            final_logit = outputs
+            det_logit = outputs
+            noise_logit = outputs
+        return det_logit, noise_logit, final_logit
+
+    def _noise_supervision_loss(noise_logit, noise_target):
+        noise_map = F.binary_cross_entropy_with_logits(noise_logit, noise_target, reduction='none')
+        if stable_noise_weight is not None:
+            stable_w = stable_noise_weight
+            if stable_w.dim() == 2:
+                stable_w = stable_w.unsqueeze(0).unsqueeze(0)
+            elif stable_w.dim() == 3:
+                stable_w = stable_w.unsqueeze(1)
+            stable_w = stable_w.to(noise_map.device, dtype=noise_map.dtype)
+            return (noise_map * stable_w).mean()
+        return noise_map.mean()
+
+    def _detector_trainable(net):
+        core = _core_model(net)
+        if not hasattr(core, "det_branch"):
+            return True
+        return any(p.requires_grad for p in core.det_branch.parameters())
+
+    # 若检测分支被冻结，强制其参数不出现在优化器中（双保险）
+    if not _detector_trainable(model_train):
+        det_param_ids = {id(p) for p in _core_model(model_train).det_branch.parameters()} if hasattr(
+            _core_model(model_train), "det_branch") else set()
+        for group in optimizer.param_groups:
+            group["params"] = [p for p in group["params"] if id(p) not in det_param_ids]
 
     if local_rank == 0:
         print('Start Train')
@@ -212,42 +299,44 @@ def fit_one_epoch(
         if iteration >= epoch_step:
             break
 
-        imgs, pngs, labels = batch
+        imgs, pngs, noise_gts, labels = batch
 
+        if iteration < 3:
+            print(f"[iter {iteration}] imgs={imgs.shape}, pngs={pngs.shape}, noise={noise_gts.shape}", flush=True)
         with torch.no_grad():
             if cuda:
                 imgs = imgs.cuda(local_rank)
                 pngs = pngs.cuda(local_rank)
+                noise_gts = noise_gts.cuda(local_rank)
                 labels = labels.cuda(local_rank)
 
         optimizer.zero_grad()
 
         if not fp16:
-            # 前向传播
-            outputs, aux1, aux2, aux3 = model_train(imgs)
 
-            # 准备不同层级的 GT（膨胀策略）
-            # final & ds1: 原始 GT（精确监督）
-            # ds2: 3x3 膨胀（感知附近有目标）
-            # ds3: 5x5 膨胀（粗定位）
-            gt_main = pngs.float()
-            gt_ds1 = gt_main
-            gt_ds2 = dilate_mask(gt_main, 3)
-            gt_ds3 = dilate_mask(gt_main, 5)
+            det_logit, noise_logit, final_logit = _forward_dual_branch(model_train, imgs)
+            seg_gt = pngs.float()
 
-            # 计算各级损失（使用 TinyObjectLoss）
-            main_loss = tiny_loss_fn(outputs, gt_main)
-            aux1_loss = tiny_loss_fn(aux1, gt_ds1)
-            aux2_loss = tiny_loss_fn(aux2, gt_ds2)
-            aux3_loss = tiny_loss_fn(aux3, gt_ds3)
+            noise_target = noise_gts.unsqueeze(1).float()
 
-            # 深监督权重分配：高分辨率权重越大
-            # main: 1.0, aux1: 0.75, aux2: 0.20, aux3: 0.05
-            loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss
+            if _detector_trainable(model_train):
+                loss_det = tiny_loss_fn(det_logit, seg_gt)
+            else:
+                with torch.no_grad():
+                    loss_det = tiny_loss_fn(det_logit, seg_gt)
+            loss_noise = _noise_supervision_loss(noise_logit, noise_target)
+            loss_fuse = tiny_loss_fn(final_logit, seg_gt)
+            loss_sparse = torch.sigmoid(noise_logit).mean()
 
+            loss = (
+                    noise_loss_weight * loss_noise +
+                    fuse_loss_weight * loss_fuse +
+                    sparse_reg_weight * loss_sparse +
+                    (det_loss_weight * loss_det if _detector_trainable(model_train) else 0.0)
+            )
             # 计算 f_score 指标
             with torch.no_grad():
-                _f_score = f_score(outputs, labels)
+                _f_score = f_score(final_logit, labels)
 
             loss.backward()
             optimizer.step()
@@ -257,25 +346,27 @@ def fit_one_epoch(
             from torch.cuda.amp import autocast
 
             with autocast():
-                outputs, aux1, aux2, aux3 = model_train(imgs)
+                det_logit, noise_logit, final_logit = _forward_dual_branch(model_train, imgs)
+                seg_gt = pngs.float()
 
-                # 准备不同层级的 GT（膨胀策略）
-                gt_main = pngs.float()
-                gt_ds1 = gt_main
-                gt_ds2 = dilate_mask(gt_main, 3)
-                gt_ds3 = dilate_mask(gt_main, 5)
-
-                # 计算各级损失（使用 TinyObjectLoss）
-                main_loss = tiny_loss_fn(outputs, gt_main)
-                aux1_loss = tiny_loss_fn(aux1, gt_ds1)
-                aux2_loss = tiny_loss_fn(aux2, gt_ds2)
-                aux3_loss = tiny_loss_fn(aux3, gt_ds3)
-
-                # 深监督权重分配
-                loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss
-
+                noise_target = noise_gts.unsqueeze(1).float()
+                if _detector_trainable(model_train):
+                    loss_det = tiny_loss_fn(det_logit, seg_gt)
+                else:
+                    with torch.no_grad():
+                        loss_det = tiny_loss_fn(det_logit, seg_gt)
+                loss_noise = _noise_supervision_loss(noise_logit, noise_target)
+                loss_fuse = tiny_loss_fn(final_logit, seg_gt)
+                loss_sparse = torch.sigmoid(noise_logit).mean()
+                loss = (
+                        noise_loss_weight * loss_noise +
+                        fuse_loss_weight * loss_fuse +
+                        sparse_reg_weight * loss_sparse +
+                        (det_loss_weight * loss_det if _detector_trainable(model_train) else 0.0)
+                )
                 with torch.no_grad():
-                    _f_score = f_score(outputs, labels)
+                    _f_score = f_score(final_logit, labels)
+
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -283,11 +374,17 @@ def fit_one_epoch(
 
         total_loss += loss.item()
         total_f_score += _f_score.item()
+        total_loss_noise += loss_noise.item()
+        total_loss_fuse += loss_fuse.item()
+        total_loss_det += loss_det.item()
+        total_loss_sparse += loss_sparse.item()
 
         if local_rank == 0:
             pbar.set_postfix(**{
                 'total_loss': total_loss / (iteration + 1),
-                'f_score': total_f_score / (iteration + 1),
+                'loss_noise': total_loss_noise / (iteration + 1),
+                'loss_fuse': total_loss_fuse / (iteration + 1),
+                'f_score_final': total_f_score / (iteration + 1),
                 'lr': get_lr(optimizer)
             })
             pbar.update(1)
@@ -313,42 +410,50 @@ def fit_one_epoch(
         if iteration >= epoch_step_val:
             break
 
-        imgs, pngs, labels = batch
+        imgs, pngs, noise_gts, labels = batch
+
 
         with torch.no_grad():
             if cuda:
                 imgs = imgs.cuda(local_rank)
                 pngs = pngs.cuda(local_rank)
+                noise_gts = noise_gts.cuda(local_rank)
                 labels = labels.cuda(local_rank)
 
-            outputs, aux1, aux2, aux3 = model_train(imgs)
-
-            # 验证时也使用膨胀策略，保持一致性
-            gt_main = pngs.float()
-            gt_ds1 = gt_main
-            gt_ds2 = dilate_mask(gt_main, 3)
-            gt_ds3 = dilate_mask(gt_main, 5)
-
-            main_loss = tiny_loss_fn(outputs, gt_main)
-            aux1_loss = tiny_loss_fn(aux1, gt_ds1)
-            aux2_loss = tiny_loss_fn(aux2, gt_ds2)
-            aux3_loss = tiny_loss_fn(aux3, gt_ds3)
-
-            loss = main_loss + 0.75 * aux1_loss + 0.20 * aux2_loss + 0.05 * aux3_loss
-
-            _f_score = f_score(outputs, labels)
+            det_logit, noise_logit, final_logit = _forward_dual_branch(model_train, imgs)
+            seg_gt = pngs.float()
+            noise_target = noise_gts.unsqueeze(1).float()
+            loss_det = tiny_loss_fn(det_logit, seg_gt)
+            loss_noise = _noise_supervision_loss(noise_logit, noise_target)
+            loss_fuse = tiny_loss_fn(final_logit, seg_gt)
+            loss_sparse = torch.sigmoid(noise_logit).mean()
+            loss = (
+                    noise_loss_weight * loss_noise +
+                    fuse_loss_weight * loss_fuse +
+                    sparse_reg_weight * loss_sparse +
+                    (det_loss_weight * loss_det if _detector_trainable(model_train) else 0.0)
+            )
+            _f_score = f_score(final_logit, labels)
 
             val_loss += loss.item()
             val_f_score += _f_score.item()
+            val_loss_noise += loss_noise.item()
+            val_loss_fuse += loss_fuse.item()
+            val_loss_det += loss_det.item()
+            val_loss_sparse += loss_sparse.item()
 
-        if local_rank == 0:
-            pbar.set_postfix(**{
-                'val_loss': val_loss / (iteration + 1),
-                'f_score': val_f_score / (iteration + 1),
-                'lr': get_lr(optimizer)
-            })
-            pbar.update(1)
+            if iteration < 3:
+                _save_vis(det_logit, noise_logit, final_logit, epoch, iteration)
 
+    if local_rank == 0:
+        pbar.set_postfix(**{
+            'val_loss': val_loss / (iteration + 1),
+            'val_loss_noise': val_loss_noise / (iteration + 1),
+            'val_loss_fuse': val_loss_fuse / (iteration + 1),
+            'f_score_final': val_f_score / (iteration + 1),
+            'lr': get_lr(optimizer)
+        })
+        pbar.update(1)
     # -----------------------------
     # 四、验证结束后，记录结果并保存模型
     # -----------------------------
@@ -361,6 +466,19 @@ def fit_one_epoch(
             total_loss / epoch_step,
             val_loss / epoch_step_val
         )
+
+        if hasattr(loss_history, "writer"):
+            loss_history.writer.add_scalar("loss_noise/train", total_loss_noise / epoch_step, epoch + 1)
+            loss_history.writer.add_scalar("loss_fuse/train", total_loss_fuse / epoch_step, epoch + 1)
+            loss_history.writer.add_scalar("loss_det/train", total_loss_det / epoch_step, epoch + 1)
+            loss_history.writer.add_scalar("loss_sparse/train", total_loss_sparse / epoch_step, epoch + 1)
+            loss_history.writer.add_scalar("f_score_final/train", total_f_score / epoch_step, epoch + 1)
+            loss_history.writer.add_scalar("loss_noise/val", val_loss_noise / epoch_step_val, epoch + 1)
+            loss_history.writer.add_scalar("loss_fuse/val", val_loss_fuse / epoch_step_val, epoch + 1)
+            loss_history.writer.add_scalar("loss_det/val", val_loss_det / epoch_step_val, epoch + 1)
+            loss_history.writer.add_scalar("loss_sparse/val", val_loss_sparse / epoch_step_val, epoch + 1)
+            loss_history.writer.add_scalar("f_score_final/val", val_f_score / epoch_step_val, epoch + 1)
+
 
         if eval_callback is not None:
             eval_callback.on_epoch_end(epoch + 1, model_train)
@@ -390,6 +508,21 @@ def fit_one_epoch(
                 model.state_dict(),
                 os.path.join(save_dir, "best_epoch_weights.pth")
             )
+            if hasattr(model, "noise_branch"):
+                torch.save(
+                    model.noise_branch.state_dict(),
+                    os.path.join(save_dir, "noise_branch_best.pth")
+                )
+            if hasattr(model, "det_branch"):
+                torch.save(
+                    model.det_branch.state_dict(),
+                    os.path.join(save_dir, "det_branch_fixed.pth")
+                )
+            if hasattr(model, "fusion_alpha"):
+                torch.save(
+                    {"fusion_alpha": model.fusion_alpha.detach().cpu()},
+                    os.path.join(save_dir, "dual_fusion_best.pth")
+                )
 
         torch.save(
             model.state_dict(),

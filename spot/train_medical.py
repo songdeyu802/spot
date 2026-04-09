@@ -175,7 +175,7 @@ if __name__ == "__main__":
     #   UnFreeze_Epoch          模型总共训练的epoch
     #   Unfreeze_batch_size     模型在解冻后的batch_size
     #------------------------------------------------------------------#
-    UnFreeze_Epoch      = 200
+    UnFreeze_Epoch      = 10
     Unfreeze_batch_size = 2
     #------------------------------------------------------------------#
     #   Freeze_Train    是否进行冻结训练
@@ -446,13 +446,13 @@ if __name__ == "__main__":
 
         #---------------------------------------#
         #   根据optimizer_type选择优化器
-        #---------------------------------------#
+        #---------------------------------------
+
         trainable_params = filter(lambda p: p.requires_grad, model.parameters())
         optimizer = {
             'adam': optim.Adam(trainable_params, Init_lr_fit, betas=(momentum, 0.999), weight_decay=weight_decay),
             'sgd': optim.SGD(trainable_params, Init_lr_fit, momentum=momentum, nesterov=True, weight_decay=weight_decay)
         }[optimizer_type]
-
         #---------------------------------------#
         #   获得学习率下降的公式
         #---------------------------------------#
