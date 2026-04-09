@@ -869,13 +869,14 @@ def main():
     vote_vis_det = (det_vote_map.astype(np.float32) / max(len(HIGH_PERCENT_LIST), 1) * 255.0).astype(np.uint8)
     Image.fromarray(vote_vis_det).save(os.path.join(SAVE_DIR, "vote_map_det.png"))
 
-    # 根据投票图生成 final_mask
+   # 根据投票图生成 final_mask
+    # 先给出默认值，避免在异常配置/错误缩进等情况下出现
+    # "local variable 'final_mask' referenced before assignment"。
+    final_mask = (final_vote_map >= 1).astype(np.uint8)
+    det_mask = (det_vote_map >= 1).astype(np.uint8)
     if USE_VOTE_FUSION:
         final_mask = (final_vote_map >= VOTE_THRESHOLD).astype(np.uint8)
         det_mask = (det_vote_map >= VOTE_THRESHOLD).astype(np.uint8)
-    else:
-        final_mask = (final_vote_map >= 1).astype(np.uint8)
-        det_mask = (det_vote_map >= 1).astype(np.uint8)
 
     noise_prob_avg = noise_prob_sum / max(len(HIGH_PERCENT_LIST), 1)
     noise_mask = (noise_prob_avg >= NOISE_THRESHOLD).astype(np.uint8)
